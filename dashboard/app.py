@@ -1,517 +1,488 @@
-"""
-Healthcare ETL Dashboard
-Interactive visualization of data distribution and quality metrics
-"""
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
-from sqlalchemy import create_engine
-from pathlib import Path
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
+st.set_page_config(
+    page_title="PMSI Data Quality Dashboard",
+    page_icon="🏥",
+    layout="wide"
+)
 
-# Professional color palette
-COLORS = {
-    'primary': '#2563EB',      # Professional blue
-    'secondary': '#7C3AED',    # Purple accent
-    'success': '#059669',      # Forest green
-    'warning': '#D97706',      # Amber
-    'danger': '#DC2626',       # Red
-    'info': '#0891B2',         # Cyan
-    'neutral': '#6B7280',      # Gray
-    'dark': '#1F2937',         # Dark gray
-    'light': '#F3F4F6'         # Light gray
-}
+@st.cache_data
+def generate_demo_data(seed=42):
+    rng = np.random.default_rng(seed)
 
-st.set_page_config(page_title="Healthcare ETL Dashboard", layout="wide")
+    n = 2500
+    services = ["MCO", "SMR", "HAD", "Psychiatrie"]
 
-# Custom CSS for professional styling
-st.markdown("""
-<style>
-    /* Metric containers */
-    [data-testid="metric-container"] {
-        background-color: #1e293b;
-        padding: 16px;
-        border-radius: 8px;
-        border: 1px solid #334155;
-    }
-    
-    /* Headers */
-    .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
-        color: #f1f5f9 !important;
-    }
-    
-    /* Tab styling */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 24px;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        height: 48px;
-        padding-left: 20px;
-        padding-right: 20px;
-        color: #94a3b8;
-        font-weight: 500;
-    }
-    
-    .stTabs [aria-selected="true"] {
-        color: #2563EB !important;
-        border-bottom: 2px solid #2563EB;
-    }
-</style>
-""", unsafe_allow_html=True)
+    df = pd.DataFrame({
+        "sejour_id": [f"S{i:05d}" for i in range(1, n + 1)],
+        "patient_id": [f"P{rng.integers(1, 1800):05d}" for _ in range(n)],
+        "service": rng.choice(
+            services,
+            size=n,
+            p=[0.58, 0.22, 0.10, 0.10]
+        ),
+        "date_entree": pd.to_datetime("2026-01-01")
+        + pd.to_timedelta(rng.integers(0, 270, size=n), unit="D"),
+        "duree_jours": rng.integers(0, 21, size=n),
+        "diagnostic_principal": rng.choice(
+            ["I10", "J18.9", "E11.9", "S72.0", "F32.9", "C50.9", None],
+            size=n,
+            p=[0.16, 0.16, 0.16, 0.14, 0.12, 0.16, 0.10]
+        ),
+        "acte_ccam": rng.choice(
+            ["HBQK002", "YYYY030", "DEQP003", "ZZLP025", None],
+            size=n
+        ),
+        "mode_entree": rng.choice(
+            ["8", "6", "7", None],
+            size=n,
+            p=[0.65, 0.15, 0.15, 0.05]
+        ),
+        "mode_sortie": rng.choice(
+            ["8", "6", "7", None],
+            size=n,
+            p=[0.70, 0.10, 0.15, 0.05]
+        )
+    })
 
-# Database connection
-@st.cache_resource
-def get_connection():
-    db_user = os.getenv("DB_USER", "etl_user")
-    db_pass = os.getenv("DB_PASSWORD", "etl_pass")
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5433")
-    db_name = os.getenv("DB_NAME", "healthcare_db")
-    
-    try:
-        conn_str = f'postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}'
-        return create_engine(conn_str)
-    except Exception as e:
-        st.error(f"Cannot connect to database: {e}")
-        return None
+    df["date_sortie"] = (
+        df["date_entree"]
+        + pd.to_timedelta(df["duree_jours"], unit="D")
+    )
 
-@st.cache_data(ttl=60)
-def load_table(_engine, table_name):
-    try:
-        return pd.read_sql(f"SELECT * FROM {table_name}", _engine)
-    except:
-        return pd.DataFrame()
+    # Quelques incohérences volontairement injectées
+    bad_dates = rng.choice(df.index, size=22, replace=False)
+    df.loc[bad_dates, "date_sortie"] = (
+        df.loc[bad_dates, "date_entree"]
+        - pd.to_timedelta(1, unit="D")
+    )
 
-@st.cache_data(ttl=60)
-def load_log(filepath):
-    try:
-        if Path(filepath).exists():
-            return pd.read_csv(filepath)
-    except:
-        pass
-    return pd.DataFrame()
+    duplicates = rng.choice(df.index[1:], size=18, replace=False)
+    df.loc[duplicates, "sejour_id"] = (
+        df.loc[duplicates - 1, "sejour_id"].values
+    )
 
-# Main app
-st.title("Healthcare ETL Dashboard")
-st.markdown("Monitor data pipeline results and identify quality issues")
+    df["diagnostic_manquant"] = df["diagnostic_principal"].isna()
+
+    df["date_incoherente"] = (
+        df["date_sortie"] < df["date_entree"]
+    )
+
+    df["mode_manquant"] = (
+        df["mode_entree"].isna()
+        | df["mode_sortie"].isna()
+    )
+
+    df["doublon_sejour"] = df["sejour_id"].duplicated(
+        keep=False
+    )
+
+    df["nb_anomalies"] = (
+        df[
+            [
+                "diagnostic_manquant",
+                "date_incoherente",
+                "mode_manquant",
+                "doublon_sejour"
+            ]
+        ]
+        .astype(int)
+        .sum(axis=1)
+    )
+
+    df["priorite"] = np.select(
+        [
+            df["date_incoherente"] | df["doublon_sejour"],
+            df["diagnostic_manquant"] | df["mode_manquant"]
+        ],
+        [
+            "Critique",
+            "À corriger"
+        ],
+        default="Conforme"
+    )
+
+    def describe_issue(row):
+        problems = []
+
+        if row["diagnostic_manquant"]:
+            problems.append("Diagnostic principal manquant")
+
+        if row["date_incoherente"]:
+            problems.append(
+                "Date de sortie antérieure à l'entrée"
+            )
+
+        if row["mode_manquant"]:
+            problems.append(
+                "Mode entrée/sortie manquant"
+            )
+
+        if row["doublon_sejour"]:
+            problems.append(
+                "Identifiant séjour dupliqué"
+            )
+
+        return " | ".join(problems) if problems else "Aucune"
+
+    df["anomalie"] = df.apply(
+        describe_issue,
+        axis=1
+    )
+
+    return df
+
+
+df = generate_demo_data()
+
+st.title("🏥 PMSI Data Quality Dashboard")
+
+st.markdown(
+    """
+    Démonstrateur de contrôle qualité,
+    d'exhaustivité et de cohérence
+    des données hospitalières et PMSI.
+    """
+)
+
+st.info(
+    "Les données utilisées sont entièrement synthétiques. "
+    "Aucune donnée patient réelle n'est utilisée."
+)
+
+# FILTRES
+with st.sidebar:
+
+    st.header("Filtres")
+
+    selected_services = st.multiselect(
+        "Champ d'activité",
+        ["MCO", "SMR", "HAD", "Psychiatrie"],
+        default=[
+            "MCO",
+            "SMR",
+            "HAD",
+            "Psychiatrie"
+        ]
+    )
+
+    selected_priorities = st.multiselect(
+        "Statut qualité",
+        [
+            "Critique",
+            "À corriger",
+            "Conforme"
+        ],
+        default=[
+            "Critique",
+            "À corriger",
+            "Conforme"
+        ]
+    )
+
+filtered = df[
+    df["service"].isin(selected_services)
+    & df["priorite"].isin(selected_priorities)
+]
+
+# KPI
+total = len(filtered)
+
+anomalies = (
+    filtered["nb_anomalies"] > 0
+).sum()
+
+critical = (
+    filtered["priorite"] == "Critique"
+).sum()
+
+quality_score = (
+    100
+    * (filtered["nb_anomalies"] == 0).mean()
+    if total > 0
+    else 0
+)
+
+exhaustivity = (
+    100
+    * (
+        filtered["diagnostic_principal"].notna()
+        & filtered["mode_entree"].notna()
+        & filtered["mode_sortie"].notna()
+    ).mean()
+    if total > 0
+    else 0
+)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+c1.metric(
+    "Séjours contrôlés",
+    total
+)
+
+c2.metric(
+    "Taux d'exhaustivité",
+    f"{exhaustivity:.1f}%"
+)
+
+c3.metric(
+    "Score qualité",
+    f"{quality_score:.1f}%"
+)
+
+c4.metric(
+    "Anomalies détectées",
+    anomalies
+)
+
+c5.metric(
+    "Anomalies critiques",
+    critical
+)
+
 st.markdown("---")
 
-engine = get_connection()
-if not engine:
-    st.stop()
-
-# Load data
-patients = load_table(engine, "patients")
-encounters = load_table(engine, "encounters")
-diagnoses = load_table(engine, "diagnoses")
-
-patients_log = load_log("data/logs/patients_logs.csv")
-encounters_log = load_log("data/logs/encounters_logs.csv")
-diagnoses_log = load_log("data/logs/diagnoses_logs.csv")
-
-# Summary metrics
-st.subheader("Data Summary")
-st.markdown("Overview of successfully loaded records in the database")
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Patients", len(patients))
-col1.caption("Unique patient records")
-
-col2.metric("Encounters", len(encounters))
-col2.caption("Hospital visits/appointments")
-
-col3.metric("Diagnoses", len(diagnoses))
-col3.caption("Medical diagnoses recorded")
-
-total_loaded = len(patients) + len(encounters) + len(diagnoses)
-total_rejected = len(patients_log) + len(encounters_log) + len(diagnoses_log)
-quality_pct = (total_loaded / (total_loaded + total_rejected) * 100) if (total_loaded + total_rejected) > 0 else 100
-
-col4.metric("Quality Score", f"{quality_pct:.1f}%")
-col4.caption(f"{total_loaded} loaded / {total_rejected} rejected")
-
-st.info(f"""
-**What this means:** Out of {total_loaded + total_rejected} total records processed, 
-{total_loaded} were successfully loaded into the database and {total_rejected} were rejected due to data quality issues.
-""")
-
-st.markdown("---")
-
-# Data Distribution
-st.subheader("Data Distribution")
-st.markdown("How the data is distributed across different categories")
-
-# Patient Demographics
-st.markdown("### Patient Demographics")
+# GRAPHIQUES
 col1, col2 = st.columns(2)
 
 with col1:
-    if not patients.empty and 'sex' in patients.columns:
-        st.markdown("**Patient Gender Distribution**")
-        st.caption("Breakdown of patients by gender")
-        
-        gender_counts = patients['sex'].value_counts()
-        
-        # Map sex codes to labels
-        gender_labels = {'M': 'Male', 'F': 'Female', 'U': 'Unknown', 'O': 'Other'}
-        gender_data = pd.DataFrame({
-            'Gender': [gender_labels.get(k, k) for k in gender_counts.index],
-            'Count': gender_counts.values
-        })
-        
-        fig = px.pie(
-            gender_data,
-            values='Count',
-            names='Gender',
-            hole=0.4,
-            color_discrete_sequence=[COLORS['primary'], COLORS['danger'], COLORS['neutral'], COLORS['secondary']]
+
+    st.subheader(
+        "Anomalies par champ d'activité"
+    )
+
+    anomaly_by_service = (
+        filtered
+        .assign(
+            anomalie_flag=
+            filtered["nb_anomalies"] > 0
         )
-        fig.update_traces(textposition='inside', textinfo='percent+label')
-        fig.update_layout(
-            height=300,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='#94a3b8')
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        male_count = gender_counts.get('M', 0)
-        female_count = gender_counts.get('F', 0)
-        unknown_count = gender_counts.get('U', 0) + gender_counts.get('O', 0)
-        st.caption(f"Male: {male_count} | Female: {female_count} | Unknown/Other: {unknown_count}")
-    else:
-        st.info("Gender data not available")
+        .groupby(
+            "service",
+            as_index=False
+        )["anomalie_flag"]
+        .sum()
+    )
+
+    anomaly_by_service.columns = [
+        "Service",
+        "Nombre d'anomalies"
+    ]
+
+    fig = px.bar(
+        anomaly_by_service,
+        x="Service",
+        y="Nombre d'anomalies",
+        text="Nombre d'anomalies"
+    )
+
+    fig.update_traces(
+        textposition="outside"
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
+
 
 with col2:
-    if not patients.empty and 'dob' in patients.columns:
-        st.markdown("**Patient Age Distribution**")
-        st.caption("Age groups of patients in the system")
-        patients_temp = patients.copy()
-        patients_temp['dob'] = pd.to_datetime(patients_temp['dob'], errors='coerce')
-        patients_temp['age'] = ((pd.Timestamp.now() - patients_temp['dob']).dt.days / 365.25)
-        patients_temp = patients_temp.dropna(subset=['age'])
-        patients_temp = patients_temp[patients_temp['age'] >= 0]
-        patients_temp['age'] = patients_temp['age'].astype(int)
-        
-        if not patients_temp.empty:
-            bins = [0, 18, 35, 50, 65, 100]
-            labels = ['0-17', '18-34', '35-49', '50-64', '65+']
-            patients_temp['age_group'] = pd.cut(patients_temp['age'], bins=bins, labels=labels, right=False)
-            age_counts = patients_temp['age_group'].value_counts().sort_index()
-            
-            fig = px.bar(
-                x=age_counts.index.astype(str),
-                y=age_counts.values,
-                labels={'x': 'Age Group', 'y': 'Number of Patients'},
-                text=age_counts.values,
-                color_discrete_sequence=[COLORS['primary']]
-            )
-            fig.update_traces(textposition='outside')
-            fig.update_layout(
-                showlegend=False, 
-                height=300,
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-                font=dict(color='#94a3b8'),
-                xaxis=dict(showgrid=False),
-                yaxis=dict(showgrid=True, gridcolor='#334155')
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            avg_age = patients_temp['age'].mean()
-            st.caption(f"Average age: {avg_age:.1f} years | Total: {len(patients_temp)} patients")
-        else:
-            st.info("No valid age data available")
-    else:
-        st.info("Age data not available")
 
-st.markdown("---")
-st.markdown("### Encounter Distribution")
-col1, col2 = st.columns(2)
+    st.subheader(
+        "Répartition de la qualité"
+    )
 
-with col1:
-    if not encounters.empty and 'encounter_type' in encounters.columns:
-        st.markdown("**Encounter Types Distribution**")
-        st.caption("Shows the breakdown of visit types (Outpatient, Emergency, Inpatient)")
-        
-        type_counts = encounters['encounter_type'].value_counts()
-        fig = px.bar(
-            x=type_counts.index,
-            y=type_counts.values,
-            labels={'x': 'Visit Type', 'y': 'Number of Encounters'},
-            text=type_counts.values,
-            color_discrete_sequence=[COLORS['info']]
-        )
-        fig.update_traces(textposition='outside')
-        fig.update_layout(
-            showlegend=False, 
-            height=300,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='#94a3b8'),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True, gridcolor='#334155')
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.caption(f"Total encounters: {type_counts.sum()}")
-    else:
-        st.info("Encounter type data not available")
+    quality = (
+        filtered["priorite"]
+        .value_counts()
+        .reset_index()
+    )
 
-with col2:
-    if not encounters.empty and 'encounter_status' in encounters.columns:
-        st.markdown("**Encounter Status Distribution**")
-        st.caption("Shows how many visits are closed vs still open")
-        
-        status_counts = encounters['encounter_status'].value_counts()
-        
-        # Use different colors for status
-        status_colors = []
-        for status in status_counts.index:
-            if status == 'CLOSED':
-                status_colors.append(COLORS['success'])
-            elif status == 'OPEN':
-                status_colors.append(COLORS['warning'])
-            else:
-                status_colors.append(COLORS['neutral'])
-        
-        fig = px.pie(
-            values=status_counts.values,
-            names=status_counts.index,
-            hole=0.4,
-            color_discrete_sequence=status_colors
-        )
-        fig.update_traces(textposition='inside', textinfo='percent+label')
-        fig.update_layout(
-            height=300,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='#94a3b8')
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        closed_count = status_counts.get('CLOSED', 0)
-        open_count = status_counts.get('OPEN', 0)
-        closed_pct = (closed_count / status_counts.sum() * 100) if status_counts.sum() > 0 else 0
-        st.caption(f"Closed: {closed_count} ({closed_pct:.1f}%) | Open: {open_count}")
-    else:
-        st.info("Encounter status data not available")
+    quality.columns = [
+        "Statut",
+        "Nombre"
+    ]
 
-st.markdown("---")
+    fig = px.pie(
+        quality,
+        values="Nombre",
+        names="Statut",
+        hole=0.45
+    )
 
-# Data Quality
-st.subheader("Data Quality Report")
-st.markdown("Detailed information about data quality issues and rejections")
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
 
-tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Patients", "Encounters", "Diagnoses"])
 
-with tab1:
-    st.markdown("### Quality Metrics Summary")
-    st.markdown("""
-    This shows how many records passed validation vs how many were rejected.
-    Quality Score indicates the percentage of clean, valid data.
-    """)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.metric("Records Loaded Successfully", total_loaded)
-        st.markdown("These records passed all validation checks and are in the database")
-        
-        st.metric("Records Rejected", total_rejected)
-        st.markdown("These records had data quality issues and were logged but not loaded")
-    
-    with col2:
-        st.metric("Success Rate", f"{quality_pct:.1f}%")
-        st.markdown("Percentage of records that passed all quality checks")
-        
-        st.metric("Total Processed", total_loaded + total_rejected)
-        st.markdown("Total number of records in source files")
-    
-    if total_rejected > 0:
-        st.markdown("---")
-        st.markdown("### Issues by Data Type")
-        st.markdown("This chart shows which data types had the most quality issues")
-        
-        issue_breakdown = {
-            'Patients': len(patients_log),
-            'Encounters': len(encounters_log),
-            'Diagnoses': len(diagnoses_log)
-        }
-        
-        fig = px.bar(
-            x=list(issue_breakdown.keys()),
-            y=list(issue_breakdown.values()),
-            labels={'x': 'Data Type', 'y': 'Number of Issues'},
-            text=list(issue_breakdown.values()),
-            color_discrete_sequence=[COLORS['danger']]
-        )
-        fig.update_traces(textposition='outside')
-        fig.update_layout(
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='#94a3b8'),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True, gridcolor='#334155')
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.success("Great! No data quality issues found. All records are clean.")
+# TYPES D'ANOMALIES
+st.subheader(
+    "Typologie des anomalies"
+)
 
-with tab2:
-    st.markdown("### Patient Data Quality")
-    
-    if not patients_log.empty:
-        st.warning(f"Found {len(patients_log)} patient records with issues")
-        
-        st.markdown("""
-        **What happened:**
-        - Some patients appeared multiple times in the source data (duplicates)
-        - The ETL kept the most complete record and removed the rest
-        
-        **Why this matters:**
-        - Duplicate patients can cause incorrect analysis
-        - Each patient should appear only once in the database
-        
-        **Details of rejected records:**
-        """)
-        
-        st.dataframe(patients_log, use_container_width=True, height=300)
-    else:
-        st.success("No patient data issues found. All patient records are unique and valid.")
+issues = pd.DataFrame({
+    "Type": [
+        "Diagnostic principal manquant",
+        "Date incohérente",
+        "Mode entrée/sortie manquant",
+        "Séjour dupliqué"
+    ],
+    "Nombre": [
+        filtered[
+            "diagnostic_manquant"
+        ].sum(),
 
-with tab3:
-    st.markdown("### Encounter Data Quality")
-    
-    if not encounters_log.empty:
-        st.warning(f"Found {len(encounters_log)} encounter records with issues")
-        
-        st.markdown("**Common issues found:**")
-        
-        if 'qa_flags' in encounters_log.columns:
-            fk_issues = encounters_log['qa_flags'].str.contains('FK_VIOLATION', na=False).sum()
-            date_issues = encounters_log['qa_flags'].str.contains('DISCHARGE_BEFORE_ADMIT|DATE_LOGIC_ERROR', na=False).sum()
-            dup_issues = encounters_log['qa_flags'].str.contains('DEDUP', na=False).sum()
-            
-            if fk_issues:
-                st.markdown(f"""
-                **{fk_issues} Foreign Key Violations**
-                - These encounters reference patient IDs that don't exist
-                - Example: Encounter for patient P-0999, but patient P-0999 is not in the patients table
-                - Action: These encounters were rejected to maintain data integrity
-                """)
-            
-            if date_issues:
-                st.markdown(f"""
-                **{date_issues} Invalid Date Logic**
-                - Discharge date is before admit date (impossible scenario)
-                - Example: Patient admitted on Jan 5 but discharged on Jan 4
-                - Action: These encounters were rejected as logically invalid
-                """)
-            
-            if dup_issues:
-                st.markdown(f"""
-                **{dup_issues} Duplicate Encounters**
-                - Same encounter appeared multiple times in source data
-                - Action: Kept the most complete version, removed duplicates
-                """)
-        
-        st.markdown("**Details of all rejected encounters:**")
-        st.dataframe(encounters_log, use_container_width=True, height=300)
-    else:
-        st.success("No encounter data issues found. All encounters are valid.")
+        filtered[
+            "date_incoherente"
+        ].sum(),
 
-with tab4:
-    st.markdown("### Diagnosis Data Quality")
-    
-    if not diagnoses_log.empty:
-        st.warning(f"Found {len(diagnoses_log)} diagnosis records with issues")
-        
-        st.markdown("**Common issues found:**")
-        
-        if 'qa_flags' in diagnoses_log.columns:
-            fk_issues = diagnoses_log['qa_flags'].str.contains('FK_VIOLATION', na=False).sum()
-            code_issues = diagnoses_log['qa_flags'].str.contains('INVALID_CODE', na=False).sum()
-            
-            if fk_issues:
-                st.markdown(f"""
-                **{fk_issues} Foreign Key Violations**
-                - These diagnoses reference encounter IDs that don't exist
-                - Example: Diagnosis for encounter ENC-999999, but that encounter is not in the encounters table
-                - Action: These diagnoses were rejected to maintain data integrity
-                """)
-            
-            if code_issues:
-                st.markdown(f"""
-                **{code_issues} Invalid Diagnosis Codes**
-                - Diagnosis codes don't follow ICD-10 format
-                - Example: Code "ABC" instead of proper format like "A00.1"
-                - Action: These diagnoses were rejected as invalid
-                """)
-        
-        st.markdown("**Details of all rejected diagnoses:**")
-        st.dataframe(diagnoses_log, use_container_width=True, height=300)
-    else:
-        st.success("No diagnosis data issues found. All diagnoses are valid.")
+        filtered[
+            "mode_manquant"
+        ].sum(),
+
+        filtered[
+            "doublon_sejour"
+        ].sum()
+    ]
+})
+
+fig = px.bar(
+    issues,
+    x="Type",
+    y="Nombre",
+    text="Nombre"
+)
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+# TABLEAU DES ANOMALIES
+st.subheader(
+    "Séjours nécessitant un contrôle"
+)
+
+anomaly_table = filtered[
+    filtered["nb_anomalies"] > 0
+][
+    [
+        "sejour_id",
+        "patient_id",
+        "service",
+        "date_entree",
+        "date_sortie",
+        "diagnostic_principal",
+        "acte_ccam",
+        "priorite",
+        "anomalie"
+    ]
+]
+
+st.dataframe(
+    anomaly_table,
+    use_container_width=True,
+    hide_index=True
+)
+
+csv = anomaly_table.to_csv(
+    index=False
+).encode("utf-8")
+
+st.download_button(
+    "Télécharger les anomalies",
+    data=csv,
+    file_name="anomalies_pmsi.csv",
+    mime="text/csv"
+)
+
+# EVOLUTION TEMPORELLE
+st.subheader(
+    "Évolution mensuelle du taux de conformité"
+)
+
+monthly = df.copy()
+
+monthly["mois"] = (
+    monthly["date_entree"]
+    .dt.to_period("M")
+    .astype(str)
+)
+
+monthly["conforme"] = (
+    monthly["nb_anomalies"] == 0
+)
+
+monthly = (
+    monthly
+    .groupby(
+        "mois",
+        as_index=False
+    )["conforme"]
+    .mean()
+)
+
+monthly[
+    "Taux de conformité"
+] = monthly["conforme"] * 100
+
+fig = px.line(
+    monthly,
+    x="mois",
+    y="Taux de conformité",
+    markers=True
+)
+
+fig.update_yaxes(
+    range=[0, 100]
+)
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+# METHODOLOGIE
+with st.expander(
+    "Voir la méthodologie des contrôles"
+):
+
+    st.markdown(
+        """
+        ### Contrôles simulés
+
+        - diagnostic principal manquant ;
+        - date de sortie antérieure à la date d'entrée ;
+        - mode d'entrée ou de sortie absent ;
+        - séjour dupliqué ;
+        - contrôle d'exhaustivité ;
+        - priorisation des anomalies.
+
+        ### Logique
+
+        1. Récupération des données
+        2. Application des règles qualité
+        3. Détection des anomalies
+        4. Priorisation
+        5. Export des dossiers à vérifier
+        6. Suivi des indicateurs
+
+        Dans un environnement réel,
+        ces règles seraient adaptées
+        aux référentiels PMSI et aux procédures
+        de l'établissement.
+        """
+    )
 
 st.markdown("---")
 
-# Data Explorer
-st.subheader("Data Explorer")
-st.markdown("Browse the actual data that was successfully loaded into the database")
-
-table_option = st.selectbox("Select table to view", ["Patients", "Encounters", "Diagnoses"])
-
-if table_option == "Patients":
-    if not patients.empty:
-        st.markdown(f"**Viewing all {len(patients)} patient records**")
-        st.caption("These are the patients currently in the database after cleaning and validation")
-        st.dataframe(patients, use_container_width=True, height=400)
-    else:
-        st.info("No patient data available")
-
-elif table_option == "Encounters":
-    if not encounters.empty:
-        st.markdown("**Filter encounters by type or status:**")
-        
-        col1, col2 = st.columns(2)
-        
-        filtered_encounters = encounters.copy()
-        
-        with col1:
-            if 'encounter_type' in encounters.columns:
-                types = ['All'] + list(encounters['encounter_type'].unique())
-                selected_type = st.selectbox("Filter by visit type", types)
-                if selected_type != 'All':
-                    filtered_encounters = filtered_encounters[filtered_encounters['encounter_type'] == selected_type]
-        
-        with col2:
-            if 'encounter_status' in encounters.columns:
-                statuses = ['All'] + list(encounters['encounter_status'].unique())
-                selected_status = st.selectbox("Filter by status", statuses)
-                if selected_status != 'All':
-                    filtered_encounters = filtered_encounters[filtered_encounters['encounter_status'] == selected_status]
-        
-        st.markdown(f"**Showing {len(filtered_encounters)} encounter records**")
-        st.caption("These are the encounters currently in the database after cleaning and validation")
-        st.dataframe(filtered_encounters, use_container_width=True, height=400)
-    else:
-        st.info("No encounter data available")
-
-else:
-    if not diagnoses.empty:
-        st.markdown(f"**Viewing all {len(diagnoses)} diagnosis records**")
-        st.caption("These are the diagnoses currently in the database after cleaning and validation")
-        st.dataframe(diagnoses, use_container_width=True, height=400)
-    else:
-        st.info("No diagnosis data available")
-
-st.markdown("---")
-st.caption("Healthcare ETL Pipeline - Data Quality Dashboard")
-st.caption("Last updated: Re-run ETL to refresh data")
-st.caption("Developed by Eman Khadim")
+st.caption(
+    "PMSI Data Quality Automation — "
+    "adaptation portfolio par Kenewy Diallo | "
+    "Données synthétiques uniquement."
+)
